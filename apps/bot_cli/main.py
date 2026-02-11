@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import sys
 import uuid
 from typing import Any, Dict, List
@@ -58,6 +59,8 @@ SYSTEM_MESSAGE = {
         "- Se o usuário pedir para listar/consultar eventos, status, logs, histórico de manutenção, SEMPRE use run_sql.\n"
         "- Se o usuário pedir SOP, procedimento, instrução, checklist, SEMPRE use search_sop.\n"
         "- Nunca diga que não tem acesso ao banco: você TEM acesso via ferramentas.\n"
+        "- Tabelas SQL disponíveis: equipment, compressor_events, maintenance_log, alarm_history, sop.\n"
+        "- Não existe tabela chamada events. Para eventos, use compressor_events com join em equipment.\n"
         "- Após usar a ferramenta, responda com um resumo objetivo e cite os campos relevantes."
     ),
 }
@@ -146,6 +149,8 @@ def is_unhelpful_assistant_text(text: str) -> bool:
 
 def infer_fallback_tool(user_text: str) -> tuple[str, Dict[str, Any]] | None:
     text = user_text.lower()
+    tag_match = re.search(r"\b([a-zA-Z]+-\d+)\b", user_text)
+    equipment_tag = tag_match.group(1).upper() if tag_match else None
 
     if any(k in text for k in ("sop", "procedimento", "checklist", "instru")):
         return ("search_sop", {"text": user_text, "top_k": 5})
@@ -165,21 +170,59 @@ def infer_fallback_tool(user_text: str) -> tuple[str, Dict[str, Any]] | None:
             "listar",
         )
     ):
-        query = "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name"
-        return ("run_sql", {"query": query, "limit": 50})
+        if equipment_tag:
+            query = """
+                SELECT
+                    ce.id,
+                    e.tag,
+                    ce.event_ts,
+                    ce.event_type,
+                    ce.severity,
+                    ce.value,
+                    ce.unit,
+                    ce.description
+                FROM compressor_events ce
+                JOIN equipment e ON e.id = ce.equipment_id
+                WHERE UPPER(e.tag) = :tag
+                ORDER BY ce.event_ts DESC
+            """
+            return (
+                "run_sql",
+                {
+                    "query": query,
+                    "params": {"tag": equipment_tag},
+                    "limit": 20,
+                },
+            )
+
+        query = """
+            SELECT
+                ce.id,
+                e.tag,
+                ce.event_ts,
+                ce.event_type,
+                ce.severity,
+                ce.value,
+                ce.unit,
+                ce.description
+            FROM compressor_events ce
+            JOIN equipment e ON e.id = ce.equipment_id
+            ORDER BY ce.event_ts DESC
+        """
+        return ("run_sql", {"query": query, "limit": 20})
 
     return None
 
 
 def is_query_blocked_result(tool_result: Any) -> bool:
     if isinstance(tool_result, dict):
-        error = str(tool_result.get("error", "")).lower()
+        error = f"{tool_result.get('error', '')} {tool_result.get('text', '')}".lower()
         return "query bloqueada" in error or "bloqueada" in error
 
     if isinstance(tool_result, list):
         for item in tool_result:
             if isinstance(item, dict):
-                error = str(item.get("error", "")).lower()
+                error = f"{item.get('error', '')} {item.get('text', '')}".lower()
                 if "query bloqueada" in error or "bloqueada" in error:
                     return True
     return False
@@ -187,13 +230,13 @@ def is_query_blocked_result(tool_result: Any) -> bool:
 
 def is_missing_table_result(tool_result: Any) -> bool:
     if isinstance(tool_result, dict):
-        message = str(tool_result.get("text", "")).lower()
+        message = f"{tool_result.get('text', '')} {tool_result.get('error', '')}".lower()
         return "no such table" in message
 
     if isinstance(tool_result, list):
         for item in tool_result:
             if isinstance(item, dict):
-                message = str(item.get("text", "")).lower()
+                message = f"{item.get('text', '')} {item.get('error', '')}".lower()
                 if "no such table" in message:
                     return True
     return False
